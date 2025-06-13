@@ -95,4 +95,6 @@ Visit here to see the GitHub Action
 Review the YAML here
 [https://github.com/britive/no-static-keys/blob/main/.github/workflows/keyless-aws-access.yml](https://github.com/britive/no-static-keys/blob/main/.github/workflows/keyless-aws-access.yml)
 
+[See a video, click here.  It is in this repo. NoKeys.mp4](NoKeys.mp4)
+
 ---
