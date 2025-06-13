@@ -52,5 +52,5 @@ jobs:
 # Verifies privileged S3 access in the NHI workflow using keyless, federated auth
       - name: Test AWS Access - List S3 Buckets
         run: |
-          echo "Listing S3 buckets...using federated credentials via Britive to list accessible S3 buckets, with no static keys."
-          aws s3 ls
+          echo "Listing S3 bucket contents using federated credentials via Britive, with no static keys."
+          aws s3 ls s3://britive-github-demo/
