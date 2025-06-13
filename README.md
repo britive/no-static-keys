@@ -62,6 +62,12 @@ Britive validates the identity, applies the policy, and issues short-lived AWS c
 The AWS CLI uses `credential_process` to inject the temporary credentials.  
 This enables a GitHub Action to access AWS without any static keys.
 
+Here’s what’s happening:
+
+- The AWS CLI sees credential_process and runs the command (pybritive ...)
+- The pybritive CLI returns temporary credentials in JSON (format expected by AWS)
+- AWS CLI uses those creds to make the actual API calls
+
 ![AWS S3 Listing Buckets - No Keys](./AWS-S3-Listing-Buckets-No-Keys.png)
 
 ---
