@@ -23,7 +23,7 @@ jobs:
 
     env:
       BRITIVE_TENANT: demo
-      BRITIVE_PROFILE_NAME: AWS Standalone/Widgeto Prod/Widgeto-App-S3-Prod-Access
+      BRITIVE_PROFILE_NAME: AWS/Sigma Prod/Britive + GitHub Actions Federated Access + AWS S3
       FED_PROVIDER: github-britive
       AWS_REGION: us-west-3 
 
