@@ -25,7 +25,7 @@ jobs:
       BRITIVE_TENANT: demo
       BRITIVE_PROFILE_NAME: AWS/724271230776 (Sigma Prod)/Britive-GitHub-Actions-Federated-Access-To-AWS-S3
       FED_PROVIDER: github-britive
-      AWS_REGION: us-west-3 
+      AWS_REGION: us-west-2 
 
     steps:
       - name: Set up Python
