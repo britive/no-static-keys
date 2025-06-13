@@ -83,4 +83,7 @@ This enables a GitHub Action to access AWS without any static keys.
 - Associating the identity with a Britive policy that allows read access to a specific AWS S3 bucket
 - Listing the bucket contents in a GitHub Action with no static credentials
 
+Visit here to see the GitHub Action
+[https://github.com/britive/no-static-keys/actions](https://github.com/britive/no-static-keys/actions)
+
 ---
