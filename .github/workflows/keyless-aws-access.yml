@@ -39,7 +39,7 @@ jobs:
         run: |
           pip install pybritive --quiet
 
-# Sets up AWS CLI to use Britive via credential_process for federated access to AWS S3 bucket.
+# Sets up AWS CLI to use Britive via credential_process for federated access to AWS S3 bucket
 
       - name: Configure Britive and AWS credential_process
         run: |
