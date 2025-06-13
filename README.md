@@ -1,6 +1,6 @@
 #  Britive + GitHub Actions: JIT Keyless Access to AWS S3
 
-This repository demonstrates how [Britive](https://www.britive.com) provides **just-in-time (JIT)**, **ephemeral**, and **keyless access** to AWS resources—like S3—using **OIDC federated identities**.
+This repository demonstrates how [Britive](https://www.britive.com) provides just-in-time (JIT), ephemeral, and keyless access to AWS resources like S3 using OIDC federated identities.
 
 No long-lived AWS credentials are stored. Instead, short-lived access is granted on demand through tightly scoped Britive policies.
 
