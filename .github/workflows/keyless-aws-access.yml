@@ -46,7 +46,7 @@ jobs:
           mkdir -p ~/.aws    
           # Set up AWS CLI to use pybritive as credential_process with default profile
           echo "[default]
-          credential_process=pybritive checkout $BRITIVE_PROFILE_NAME -m awscredentialprocess -P $FED_PROVIDER" > ~/.aws/credentials
+          credential_process=pybritive checkout \"$BRITIVE_PROFILE_NAME\" -m awscredentialprocess -P $FED_PROVIDER" > ~/.aws/credentials
           aws configure set default.region "$AWS_REGION"
 
 # Verifies privileged S3 access in the NHI workflow using keyless, federated auth
