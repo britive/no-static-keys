@@ -1,0 +1,56 @@
+name: Britive + GitHub Actions Federated Access + AWS S3
+# This GitHub Actions workflow demonstrates a secure, automated way to access AWS resources such as S3 
+# without using static credentials. It installs the pybritive CLI, configures AWS to use OIDC federation
+# via Britive, and sets the credential_process to dynamically retrieve short-lived AWS credentials from Britive. The workflow
+# runs as part of the NHI automation and confirms successful privileged access by listing S3 buckets. This keyless
+# approach ensures strong security by leveraging GitHub’s OIDC identity and Britive’s just-in-time access controls.
+
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * *'  # Runs daily at 08:00 UTC
+
+# Enables OIDC token for federated login to Britive
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  federated-aws-access:
+    runs-on: ubuntu-latest
+
+    env:
+      BRITIVE_TENANT: demo
+      BRITIVE_PROFILE_NAME: AWS Standalone/Widgeto Prod/Widgeto-App-S3-Prod-Access
+      FED_PROVIDER: github-britive
+      AWS_REGION: us-west-3 
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+# Installs the pybritive CLI for federated identity operations
+
+      - name: Install pybritive cli
+        run: |
+          pip install pybritive --quiet
+
+# Sets up AWS CLI to use Britive via credential_process for federated access to AWS S3 bucket.
+
+      - name: Configure Britive and AWS credential_process
+        run: |
+          mkdir -p ~/.aws    
+          # Set up AWS CLI to use pybritive as credential_process with default profile
+          echo "[default]
+          credential_process=pybritive checkout $BRITIVE_PROFILE_NAME -m awscredentialprocess -P $FED_PROVIDER" > ~/.aws/credentials
+          aws configure set default.region "$AWS_REGION"
+
+# Verifies privileged S3 access in the NHI workflow using keyless, federated auth
+      - name: Test AWS Access - List S3 Buckets
+        run: |
+          echo "Listing S3 buckets...using federated credentials via Britive to list accessible S3 buckets, with no static keys."
+          aws s3 ls
