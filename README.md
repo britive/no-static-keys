@@ -86,4 +86,7 @@ This enables a GitHub Action to access AWS without any static keys.
 Visit here to see the GitHub Action
 [https://github.com/britive/no-static-keys/actions](https://github.com/britive/no-static-keys/actions)
 
+Review the YAML here
+[https://github.com/britive/no-static-keys/blob/main/.github/workflows/keyless-aws-access.yml](https://github.com/britive/no-static-keys/blob/main/.github/workflows/keyless-aws-access.yml)
+
 ---
