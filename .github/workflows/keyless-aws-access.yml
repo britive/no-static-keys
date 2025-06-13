@@ -53,4 +53,4 @@ jobs:
       - name: Test AWS Access - List S3 Buckets
         run: |
           echo "Listing S3 bucket contents using federated credentials via Britive, with no static keys."
-          aws s3 ls s3://britive-github-federated-demo/
+          aws s3 ls s3://britive-federated-github-demo/
