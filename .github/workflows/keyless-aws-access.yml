@@ -1,4 +1,4 @@
-name: Britive keyless intake pipeline (GitHub OIDC -> Britive -> AWS S3)
+name: Britive keyless intake pipeline (GitHub OIDC -> Britive -> AWS, GCP, Azure)
 # A nightly "intake" job with NO stored cloud keys.
 #
 #   1. GitHub mints an OIDC token for this repo + branch.
@@ -35,6 +35,8 @@ env:
 jobs:
   aws-intake:
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.gen.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
 
@@ -82,6 +84,7 @@ jobs:
           echo "::notice::Writing as $ARN (a JIT role session, minted seconds ago)"
 
       - name: Generate today's intake batch
+        id: gen
         run: |
           python3 scripts/gen-intake.py \
             --date "$BATCH_DATE" \
@@ -94,6 +97,7 @@ jobs:
             --written-by "$WRITER_ARN"
           echo "rows: $(($(wc -l < /tmp/intake.csv) - 1))"
           sha256sum /tmp/intake.csv | tee /tmp/local.sha
+          echo "sha=$(cut -d' ' -f1 /tmp/local.sha)" >> "$GITHUB_OUTPUT"
 
       - name: Write the batch to S3
         run: |
@@ -139,3 +143,210 @@ jobs:
         run: |
           pybritive checkin "$BRITIVE_PROFILE" -P "$FED_PROVIDER" || true
           echo "Checked in. The role session above stops being re-issuable now."
+
+  # ---------------------------------------------------------------------------
+  # GCP: same identity, same batch, project `lendingsavings`.
+  # Profile NHI-Intake-GCP-Writer = Storage Object User with an IAM condition
+  # that pins it to ONE bucket. Britive mints a fresh service account per
+  # checkout, and the binding can take a little while to propagate, so we poll.
+  # ---------------------------------------------------------------------------
+  gcp-intake:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.gen.outputs.sha }}
+    env:
+      GCP_PROFILE: "GCP - CIS/GCP - CIS/NHI-Intake-GCP-Writer"
+      GCS_BUCKET: britive-nhi-intake-810261868576
+      NEIGHBOUR_BUCKET: acme-corp-backup-storage   # same project, must be denied
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet pybritive
+      - run: echo "BATCH_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Britive checkout (federated, no stored keys)
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            rc=0
+            pybritive checkout "$GCP_PROFILE" -P "$FED_PROVIDER" -m json --silent > /tmp/co.out 2>&1 || rc=$?
+            if [ "$rc" -eq 0 ] && grep -q 'private_key' /tmp/co.out; then echo "checkout ok on attempt $attempt"; break; fi
+            echo "attempt $attempt failed (rc=$rc): $(grep -v private_key /tmp/co.out | head -c 300)"
+            if [ "$attempt" -eq 6 ]; then exit 1; fi
+            sleep 20
+          done
+          # The key arrives either as the key JSON itself or as
+          # {"<sa-email>": "<key JSON as a string>"}; normalise to a key file.
+          python3 scripts/sa-key.py /tmp/co.out /tmp/sa.json
+          rm -f /tmp/co.out
+          gcloud auth activate-service-account --key-file=/tmp/sa.json --quiet
+          rm -f /tmp/sa.json
+          echo "WRITER=$(gcloud config get-value account 2>/dev/null)" >> "$GITHUB_ENV"
+
+      - name: Generate today's intake batch
+        id: gen
+        run: |
+          python3 scripts/gen-intake.py --date "$BATCH_DATE" --out /tmp/intake.csv \
+            --manifest /tmp/intake.manifest.json --cloud gcp \
+            --run-id "${{ github.run_id }}" --repo "${{ github.repository }}" \
+            --actor "${{ github.actor }}" --written-by "$WRITER"
+          echo "sha=$(sha256sum /tmp/intake.csv | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Write the batch to GCS (polls while the grant propagates)
+        run: |
+          start=$(date +%s)
+          for i in $(seq 1 16); do
+            rc=0
+            gcloud storage cp /tmp/intake.csv "gs://$GCS_BUCKET/$PREFIX/daily/$BATCH_DATE.csv" 2>/tmp/err || rc=$?
+            if [ "$rc" -eq 0 ]; then echo "grant live after $(( $(date +%s) - start ))s"; break; fi
+            if [ "$i" -eq 16 ]; then cat /tmp/err; exit 1; fi
+            sleep 15
+          done
+          gcloud storage cp /tmp/intake.manifest.json "gs://$GCS_BUCKET/$PREFIX/daily/$BATCH_DATE.manifest.json"
+          echo "::notice::Wrote gs://$GCS_BUCKET/$PREFIX/daily/$BATCH_DATE.csv as $WRITER"
+
+      - name: Read it back and verify
+        run: |
+          gcloud storage cp "gs://$GCS_BUCKET/$PREFIX/daily/$BATCH_DATE.csv" /tmp/readback.csv
+          [ "$(sha256sum < /tmp/intake.csv)" = "$(sha256sum < /tmp/readback.csv)" ] || { echo "::error::read-back mismatch"; exit 1; }
+          echo "Round-trip verified."
+
+      - name: Prove the scope - the neighbouring bucket is denied
+        run: |
+          echo nope > /tmp/nope.txt
+          rc=0; gcloud storage cp /tmp/nope.txt "gs://$NEIGHBOUR_BUCKET/not-mine.txt" 2>/tmp/err || rc=$?
+          if [ "$rc" -eq 0 ]; then echo "::error::write to $NEIGHBOUR_BUCKET SUCCEEDED"; exit 1; fi
+          echo "DENIED (rc=$rc): $(grep -o 'HTTPError 40[0-9]' /tmp/err | head -1) writing to $NEIGHBOUR_BUCKET"
+
+      - name: Keep the last ${{ env.RETAIN }} batches
+        run: |
+          gcloud storage ls "gs://$GCS_BUCKET/$PREFIX/daily/" | sed "s#gs://$GCS_BUCKET/##" \
+            | python3 scripts/prune.py --mode date --keep "$RETAIN" \
+            | while read -r key; do
+                [ -n "$key" ] || continue
+                case "$key" in "$PREFIX"/daily/*) ;; *) echo "refusing $key"; exit 1;; esac
+                gcloud storage rm "gs://$GCS_BUCKET/$key" && echo "pruned $key"
+              done
+          gcloud storage ls -l "gs://$GCS_BUCKET/$PREFIX/daily/"
+
+      - name: Check the credential back in
+        if: always()
+        run: pybritive checkin "$GCP_PROFILE" -P "$FED_PROVIDER" || true
+
+  # ---------------------------------------------------------------------------
+  # Azure: same identity, profile Acme-Corp-Storage-Container (Storage Blob Data
+  # Contributor on resource group acmecorpbackupstorage). Britive mints a new
+  # service principal per checkout; the role assignment takes a moment to land.
+  # Honest scope note: Azure grants land at the resource group, so this
+  # identity could also reach the other container in the same account.
+  # ---------------------------------------------------------------------------
+  azure-intake:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.gen.outputs.sha }}
+    env:
+      AZ_PROFILE: "Britive Azure Tenant/Britive Azure Tenant/Acme-Corp-Storage-Container"
+      AZ_ACCOUNT: acmecorpbackupstorage
+      AZ_CONTAINER: nhi-intake
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet pybritive
+      - run: echo "BATCH_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Britive checkout + az login (federated, no stored keys)
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            rc=0
+            pybritive checkout "$AZ_PROFILE" -P "$FED_PROVIDER" -m json --silent > /tmp/co.out 2>&1 || rc=$?
+            ok=0; python3 scripts/az-creds.py /tmp/co.out /tmp/az.env || ok=$?
+            if [ "$rc" -eq 0 ] && [ "$ok" -eq 0 ]; then echo "checkout ok on attempt $attempt"; break; fi
+            echo "attempt $attempt failed (rc=$rc)"
+            # a retry that lands on an existing transaction gets no secret: check in first
+            pybritive checkin "$AZ_PROFILE" -P "$FED_PROVIDER" >/dev/null 2>&1 || true
+            if [ "$attempt" -eq 6 ]; then exit 1; fi
+            sleep 20
+          done
+          rm -f /tmp/co.out
+          set -a; . /tmp/az.env; set +a; rm -f /tmp/az.env
+          echo "::add-mask::$AZ_SECRET"
+          for i in $(seq 1 12); do
+            rc=0; az login --service-principal -u "$AZ_CLIENT" --password="$AZ_SECRET" --tenant "$AZ_TENANT" --allow-no-subscriptions -o none || rc=$?
+            [ "$rc" -eq 0 ] && break
+            [ "$i" -eq 12 ] && exit 1
+            sleep 15
+          done
+          echo "WRITER=service principal $AZ_CLIENT (minted for this run)" >> "$GITHUB_ENV"
+
+      - name: Generate today's intake batch
+        id: gen
+        run: |
+          python3 scripts/gen-intake.py --date "$BATCH_DATE" --out /tmp/intake.csv \
+            --manifest /tmp/intake.manifest.json --cloud azure \
+            --run-id "${{ github.run_id }}" --repo "${{ github.repository }}" \
+            --actor "${{ github.actor }}" --written-by "$WRITER"
+          echo "sha=$(sha256sum /tmp/intake.csv | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Write the batch to Azure Blob (polls while the role lands)
+        run: |
+          start=$(date +%s)
+          for i in $(seq 1 20); do
+            rc=0
+            az storage blob upload --account-name "$AZ_ACCOUNT" -c "$AZ_CONTAINER" -n "daily/$BATCH_DATE.csv" \
+              -f /tmp/intake.csv --overwrite --auth-mode login -o none --only-show-errors || rc=$?
+            if [ "$rc" -eq 0 ]; then echo "role live after $(( $(date +%s) - start ))s"; break; fi
+            [ "$i" -eq 20 ] && exit 1
+            sleep 15
+          done
+          az storage blob upload --account-name "$AZ_ACCOUNT" -c "$AZ_CONTAINER" -n "daily/$BATCH_DATE.manifest.json" \
+            -f /tmp/intake.manifest.json --overwrite --auth-mode login -o none --only-show-errors
+          echo "::notice::Wrote $AZ_ACCOUNT/$AZ_CONTAINER/daily/$BATCH_DATE.csv"
+
+      - name: Read it back and verify
+        run: |
+          az storage blob download --account-name "$AZ_ACCOUNT" -c "$AZ_CONTAINER" -n "daily/$BATCH_DATE.csv" \
+            -f /tmp/readback.csv --auth-mode login -o none --only-show-errors
+          [ "$(sha256sum < /tmp/intake.csv)" = "$(sha256sum < /tmp/readback.csv)" ] || { echo "::error::read-back mismatch"; exit 1; }
+          echo "Round-trip verified."
+
+      - name: Prove the scope - no control-plane access
+        run: |
+          rc=0; az group list -o none 2>/tmp/err || rc=$?
+          if [ "$rc" -eq 0 ]; then echo "::error::listing resource groups SUCCEEDED"; exit 1; fi
+          echo "DENIED (rc=$rc): this identity holds blob data rights only, no subscription access"
+
+      - name: Keep the last ${{ env.RETAIN }} batches
+        run: |
+          az storage blob list --account-name "$AZ_ACCOUNT" -c "$AZ_CONTAINER" --prefix daily/ \
+            --auth-mode login --query "[].name" -o tsv \
+            | python3 scripts/prune.py --mode date --keep "$RETAIN" \
+            | while read -r key; do
+                [ -n "$key" ] || continue
+                case "$key" in daily/*) ;; *) echo "refusing $key"; exit 1;; esac
+                az storage blob delete --account-name "$AZ_ACCOUNT" -c "$AZ_CONTAINER" -n "$key" --auth-mode login -o none && echo "pruned $key"
+              done
+          az storage blob list --account-name "$AZ_ACCOUNT" -c "$AZ_CONTAINER" --prefix daily/ --auth-mode login -o table
+
+      - name: Check the credential back in
+        if: always()
+        run: |
+          az logout || true
+          pybritive checkin "$AZ_PROFILE" -P "$FED_PROVIDER" || true
+
+  # Three clouds, three JIT identities, one batch: the bytes must match.
+  compare-clouds:
+    needs: [aws-intake, gcp-intake, azure-intake]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Same bytes in every cloud
+        run: |
+          A="${{ needs.aws-intake.outputs.sha }}"; G="${{ needs.gcp-intake.outputs.sha }}"; Z="${{ needs.azure-intake.outputs.sha }}"
+          echo "aws   $A"; echo "gcp   $G"; echo "azure $Z"
+          if [ -n "$A" ] && [ "$A" = "$G" ] && [ "$A" = "$Z" ]; then
+            echo "::notice::Identical batch in S3, GCS and Azure Blob, written by three separate JIT identities."
+          else
+            echo "::error::clouds differ"; exit 1
+          fi
