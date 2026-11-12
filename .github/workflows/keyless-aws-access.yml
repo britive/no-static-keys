@@ -1,56 +1,137 @@
-name: Britive + GitHub Actions Federated Access + AWS S3
-# This GitHub Actions workflow demonstrates a secure, automated way to access AWS resources such as S3 
-# without using static credentials. It installs the pybritive CLI, configures AWS to use OIDC federation
-# via Britive, and sets the credential_process to dynamically retrieve short-lived AWS credentials from Britive. The workflow
-# runs as part of the NHI automation and confirms successful privileged access by listing S3 buckets. This keyless
-# approach ensures strong security by leveraging GitHub’s OIDC identity and Britive’s just-in-time access controls.
-
+name: Britive keyless intake pipeline (GitHub OIDC -> Britive -> AWS S3)
+# A nightly "intake" job with NO stored cloud keys.
+#
+#   1. GitHub mints an OIDC token for this repo + branch.
+#   2. Britive (demo.britive-app.com) trusts that token through the `Github`
+#      identity provider and maps it to the federated service identity
+#      NHI-Intake-GitHub-no-static-keys.
+#   3. That identity checks out the Britive profile NHI-Intake-AWS-Writer and
+#      receives short-lived AWS credentials for one IAM role whose only power
+#      is read/write under   s3://<bucket>/demo-tenant/*
+#   4. The job writes today's customer-intake batch, reads it back, proves a
+#      write OUTSIDE its prefix is denied, then checks the credential back in.
+#
+# The same batch is what humans and AI agents read later through the
+# NHI-Intake-AWS-Reader profile (and, later, through the Britive MCP Gateway).
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 8 * * *'  # Runs daily at 08:00 UTC
-
-# Enables OIDC token for federated login to Britive
+    - cron: '0 8 * * 1-5'   # weekdays 08:00 UTC; a Monday demo shows Friday's batch
 
 permissions:
-  id-token: write
+  id-token: write   # lets the job request a GitHub OIDC token
   contents: read
 
+env:
+  BRITIVE_TENANT: demo
+  FED_PROVIDER: github-britive            # GitHub OIDC token, audience "britive"
+  BRITIVE_PROFILE: "AWS SE Organization/696226360299 (se-demo)/NHI-Intake-AWS-Writer"
+  S3_BUCKET: britive-jit-demo-696226360299
+  PREFIX: demo-tenant                     # the ONLY place this identity can touch
+  AWS_REGION: us-east-1
+  RETAIN: 10                              # batch dates kept under demo-tenant/daily/
+
 jobs:
-  federated-aws-access:
+  aws-intake:
     runs-on: ubuntu-latest
-
-    env:
-      BRITIVE_TENANT: demo
-      BRITIVE_PROFILE_NAME: AWS/724271230776 (Sigma Prod)/Britive-GitHub-Actions-Federated-Access-To-AWS-S3
-      FED_PROVIDER: github-britive
-      AWS_REGION: us-west-2 
-
     steps:
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
-# Installs the pybritive CLI for federated identity operations
+      - name: Install pybritive
+        run: pip install --quiet pybritive
 
-      - name: Install pybritive cli
+      - name: Batch date
+        run: echo "BATCH_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      # Keyless: no secrets in this repo. pybritive exchanges the GitHub OIDC
+      # token for a Britive session, then checks out the profile.
+      - name: Britive checkout (federated, no stored keys)
         run: |
-          pip install pybritive --quiet
+          for attempt in 1 2 3 4 5 6; do
+            rc=0
+            pybritive checkout "$BRITIVE_PROFILE" -P "$FED_PROVIDER" -m env-nix --silent > /tmp/co.out 2>&1 || rc=$?
+            if [ "$rc" -eq 0 ] && grep -q '^export AWS_SECRET_ACCESS_KEY=' /tmp/co.out; then
+              echo "checkout ok on attempt $attempt"; break
+            fi
+            echo "attempt $attempt failed (rc=$rc): $(grep -v AWS_ /tmp/co.out | head -c 300)"
+            if [ "$attempt" -eq 6 ]; then exit 1; fi
+            sleep 20
+          done
+          grep '^export AWS_' /tmp/co.out | sed 's/^export //' > /tmp/aws.env
+          rm -f /tmp/co.out
+          set -a; . /tmp/aws.env; set +a
+          echo "::add-mask::$AWS_ACCESS_KEY_ID"
+          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+          echo "::add-mask::$AWS_SESSION_TOKEN"
+          cat /tmp/aws.env >> "$GITHUB_ENV"
+          rm -f /tmp/aws.env
 
-# Sets up AWS CLI to use Britive via credential_process for federated access to AWS S3 bucket
-
-      - name: Configure Britive and AWS credential_process
+      - name: Who am I in AWS?
         run: |
-          mkdir -p ~/.aws    
-          # Set up AWS CLI to use pybritive as credential_process with default profile
-          echo "[default]
-          credential_process=pybritive checkout \"$BRITIVE_PROFILE_NAME\" -m awscredentialprocess -P $FED_PROVIDER" > ~/.aws/credentials
-          aws configure set default.region "$AWS_REGION"
+          ARN=$(aws sts get-caller-identity --query Arn --output text)
+          echo "WRITER_ARN=$ARN" >> "$GITHUB_ENV"
+          echo "::notice::Writing as $ARN (a JIT role session, minted seconds ago)"
 
-# Verifies privileged S3 access in the NHI workflow using keyless, federated auth
-      - name: Test AWS Access - List S3 Buckets
+      - name: Generate today's intake batch
         run: |
-          echo "Listing S3 bucket contents using federated credentials via Britive, with no static keys."
-          aws s3 ls s3://britive-federated-github-demo/
+          python3 scripts/gen-intake.py \
+            --date "$BATCH_DATE" \
+            --out /tmp/intake.csv \
+            --manifest /tmp/intake.manifest.json \
+            --cloud aws \
+            --run-id "${{ github.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --actor "${{ github.actor }}" \
+            --written-by "$WRITER_ARN"
+          echo "rows: $(($(wc -l < /tmp/intake.csv) - 1))"
+          sha256sum /tmp/intake.csv | tee /tmp/local.sha
+
+      - name: Write the batch to S3
+        run: |
+          aws s3 cp /tmp/intake.csv           "s3://$S3_BUCKET/$PREFIX/daily/$BATCH_DATE.csv"           --only-show-errors
+          aws s3 cp /tmp/intake.manifest.json "s3://$S3_BUCKET/$PREFIX/daily/$BATCH_DATE.manifest.json" --only-show-errors
+          echo "::notice::Wrote s3://$S3_BUCKET/$PREFIX/daily/$BATCH_DATE.csv"
+
+      - name: Read it back and verify
+        run: |
+          aws s3 cp "s3://$S3_BUCKET/$PREFIX/daily/$BATCH_DATE.csv" /tmp/readback.csv --only-show-errors
+          LOCAL=$(cut -d' ' -f1 /tmp/local.sha); REMOTE=$(sha256sum /tmp/readback.csv | cut -d' ' -f1)
+          echo "local  $LOCAL"; echo "remote $REMOTE"
+          [ "$LOCAL" = "$REMOTE" ] || { echo "::error::read-back mismatch"; exit 1; }
+          echo "Round-trip verified."
+
+      # Least privilege, shown rather than claimed. Both commands MUST fail;
+      # the step fails if either one succeeds.
+      - name: Prove the scope - writes outside demo-tenant/ are denied
+        run: |
+          echo "nope" > /tmp/nope.txt
+          rc=0; aws s3 cp /tmp/nope.txt "s3://$S3_BUCKET/daily/not-mine.txt" --only-show-errors 2> /tmp/err1 || rc=$?
+          if [ "$rc" -eq 0 ]; then echo "::error::write outside the prefix SUCCEEDED"; exit 1; fi
+          echo "DENIED (rc=$rc): $(grep -o 'AccessDenied[^:]*' /tmp/err1 | head -1)"
+          rc=0; aws s3 ls > /dev/null 2> /tmp/err2 || rc=$?
+          if [ "$rc" -eq 0 ]; then echo "::error::list-all-buckets SUCCEEDED"; exit 1; fi
+          echo "DENIED (rc=$rc): list all buckets"
+
+      - name: Keep the last ${{ env.RETAIN }} batches
+        run: |
+          aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$PREFIX/daily/" \
+            --query 'Contents[].Key' --output text | tr '\t' '\n' | grep -v '^None$' \
+            | python3 scripts/prune.py --mode date --keep "$RETAIN" \
+            | while read -r key; do
+                [ -n "$key" ] || continue
+                case "$key" in "$PREFIX"/daily/*) ;; *) echo "refusing $key"; exit 1;; esac
+                aws s3 rm "s3://$S3_BUCKET/$key" --only-show-errors && echo "pruned $key"
+              done
+          echo "Batches now in s3://$S3_BUCKET/$PREFIX/daily/:"
+          aws s3 ls "s3://$S3_BUCKET/$PREFIX/daily/"
+
+      - name: Check the credential back in
+        if: always()
+        run: |
+          pybritive checkin "$BRITIVE_PROFILE" -P "$FED_PROVIDER" || true
+          echo "Checked in. The role session above stops being re-issuable now."
