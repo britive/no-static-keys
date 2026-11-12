@@ -62,14 +62,18 @@ jobs:
             if [ "$attempt" -eq 6 ]; then exit 1; fi
             sleep 20
           done
-          grep '^export AWS_' /tmp/co.out | sed 's/^export //' > /tmp/aws.env
+          grep '^export AWS_' /tmp/co.out > /tmp/aws.env
           rm -f /tmp/co.out
-          set -a; . /tmp/aws.env; set +a
+          set -a; . /tmp/aws.env; set +a      # the shell strips pybritive's quoting
+          rm -f /tmp/aws.env
           echo "::add-mask::$AWS_ACCESS_KEY_ID"
           echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
           echo "::add-mask::$AWS_SESSION_TOKEN"
-          cat /tmp/aws.env >> "$GITHUB_ENV"
-          rm -f /tmp/aws.env
+          {
+            echo "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID"
+            echo "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"
+            echo "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN"
+          } >> "$GITHUB_ENV"
 
       - name: Who am I in AWS?
         run: |
